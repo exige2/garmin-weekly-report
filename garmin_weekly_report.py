@@ -198,26 +198,75 @@ def _extract_laps(splits: dict) -> list:
     return laps
 
 
-def classify_workout(act: dict, week_longest_m: float, laps: list) -> str:
-    """アクティビティ名・距離・ラップのペースばらつきからトレーニング種別を推定。"""
+def _is_structured_intervals(laps: list) -> bool:
+    """ラップ距離の不揃いさ＋HRの振れから「構造化インターバル」を判定。
+
+    Garminは1kmごとに自動ラップを切るため、イージー走でも歩き・減速で
+    ペース差は大きくなる。そこで『ペース差』ではなく、本物のインターバルに固有の
+    『rep距離の不揃い（例: 800m/400m交互）』と『HRの交互の振れ』を見る。
+    """
+    main = [l for l in laps if l["dist_m"] >= 200]   # 端数/極小ラップ除外
+    if len(main) < 4:
+        return False
+    dists = [l["dist_m"] for l in main]
+    core  = dists[:-1] if len(dists) > 4 else dists   # 末尾の端数ラップを除外
+    avg   = sum(core) / len(core)
+    if avg <= 0:
+        return False
+    cv = (sum((d - avg) ** 2 for d in core) / len(core)) ** 0.5 / avg  # 距離の変動係数
+    hrs = [l["avg_hr"] for l in main if l.get("avg_hr")]
+    hr_spread = (max(hrs) - min(hrs)) if len(hrs) >= 4 else 0
+
+    # ① rep距離が不揃い（＝手動/ワークアウトのラップ）→ 構造化練習
+    if cv >= 0.15 and hr_spread >= 25:
+        return True
+    if cv >= 0.30:
+        return True
+    # ② 距離は均一でも、明確な work/rest 交互（HR連動）があればインターバル
+    if len(main) >= 6 and hr_spread >= 30:
+        paces = [_pace_min_per_km(l["dist_m"], l["dur_s"]) for l in main]
+        ps = sorted(p for p in paces if p)
+        if ps:
+            med    = ps[len(ps) // 2]
+            med_hr = sorted(hrs)[len(hrs) // 2]
+            work = sum(1 for l, p in zip(main, paces)
+                       if p and p < med - 0.4 and (l.get("avg_hr") or 0) > med_hr + 12)
+            rest = sum(1 for l, p in zip(main, paces)
+                       if p and p > med + 0.4 and (l.get("avg_hr") or 999) < med_hr - 12)
+            if work >= 3 and rest >= 3:
+                return True
+    return False
+
+
+def classify_workout(act: dict, week_longest_m: float, laps: list, hr_zone_pct: dict = None) -> str:
+    """アクティビティ名・ラップ構造・距離・HRゾーンからトレーニング種別を推定。"""
+    # ① アクティビティ名のキーワードが最優先（ユーザーが命名していれば従う）
     name = (act.get("activityName") or "").lower()
     for label, kws in _TYPE_KEYWORDS:
         if any(k.lower() in name for k in kws):
             return label
 
+    # ② 構造化インターバル（rep距離の不揃い＋HRの交互振れ）
+    if laps and _is_structured_intervals(laps):
+        return "interval"
+
     dist = act.get("distance", 0) or 0
-    # ロング走: 18km以上、または週最長かつ15km以上
+    dur  = act.get("duration", 0) or 0
+    # ③ ロング走: 18km以上、または週最長かつ15km以上
     if dist >= 18000 or (week_longest_m and dist >= 0.95 * week_longest_m and dist >= 15000):
         return "long"
 
-    # ラップ間ペース差で緩急（インターバル/変化走）を判定
-    paces = [p for p in (_pace_min_per_km(l["dist_m"], l["dur_s"]) for l in laps) if p]
-    if len(paces) >= 4:
-        spread = max(paces) - min(paces)
-        if spread >= 1.2:          # ラップ間で 1'12"/km 以上の差 → 緩急あり
-            return "interval"
-        if spread >= 0.5 and (act.get("averageHR") or 0) >= 150:
+    # ④ テンポ/閾値: 連続走で高強度。HRゾーンがあれば優先（個人差に強い）
+    if hr_zone_pct:
+        hard = hr_zone_pct.get("z4", 0) + hr_zone_pct.get("z5", 0)
+        if hard >= 40:
             return "tempo"
+    else:
+        hr = act.get("averageHR") or 0
+        p  = _pace_min_per_km(dist, dur)
+        if hr >= 160 and p and p < 6.0:
+            return "tempo"
+
     return "easy"
 
 
@@ -272,19 +321,21 @@ def summarize_activity(client, act: dict, week_longest_m: float) -> dict:
     except Exception as e:
         log(f"  ラップ取得スキップ (id={aid}): {e}")
 
-    rec["workout_type"] = classify_workout(act, week_longest_m, laps)
-
-    # HRゾーン配分（80/20分析用）
+    # HRゾーン配分（80/20分析＋テンポ判定に使用）。種別判定より先に取得する。
+    hr_zone_pct = None
     try:
         zones = client.get_activity_hr_in_timezones(aid) or []
         total = sum(z.get("secsInZone", 0) for z in zones)
         if total > 0:
-            rec["hr_zone_pct"] = {
+            hr_zone_pct = {
                 f"z{z.get('zoneNumber')}": round(100 * z.get("secsInZone", 0) / total)
                 for z in zones if z.get("zoneNumber")
             }
+            rec["hr_zone_pct"] = hr_zone_pct
     except Exception as e:
         log(f"  HRゾーン取得スキップ (id={aid}): {e}")
+
+    rec["workout_type"] = classify_workout(act, week_longest_m, laps, hr_zone_pct)
 
     # ラップは質練習・ロング・レースのみ payload に含める（トークン節約）
     if rec["workout_type"] in ("interval", "tempo", "long", "race") and laps:

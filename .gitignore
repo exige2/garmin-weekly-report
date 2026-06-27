@@ -1,0 +1,20 @@
+# 認証情報（絶対にコミットしない）
+config.ini
+
+# 実行ログ
+garmin_report.log
+
+# Garmin 認証トークンのキャッシュ
+.garminconnect/
+garmin_tokens.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

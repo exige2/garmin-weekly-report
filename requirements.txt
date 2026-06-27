@@ -1,0 +1,12 @@
+# Garmin Connect 週次ランニングレポート 依存パッケージ
+#   インストール: pip install -r requirements.txt
+
+# Garmin Connect 非公式APIラッパー（0.3.0以降はネイティブ認証）
+garminconnect>=0.3.0
+
+# HTTPリクエスト（Gemini API / LINE API 呼び出し用）
+requests>=2.31.0
+
+# 以下は garminconnect が自動で入れる依存（明示しておくと環境差異に強い）
+curl_cffi
+ua-generator

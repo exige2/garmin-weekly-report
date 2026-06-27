@@ -3,12 +3,18 @@
 Garmin Connect 週次ランニングレポート（LLM分析版 / Gemini Flash）
 Gemini API でトレーニングを分析し、目標達成に向けた進捗をLINEに通知します。
 
-設定はすべて同じフォルダの config.ini から読み込みます。
-（config.example.ini をコピーして config.ini を作成し、各自の値を記入してください）
+設定の読み込み順は「環境変数（GitHub Secrets等）→ config.ini」です。
+- ローカルPC実行: config.example.ini をコピーして config.ini に記入
+- GitHub Actions等のクラウド実行: 環境変数（Secrets）で渡す（config.ini不要）
+
+Garmin認証は次の優先順位:
+  1. GARMIN_TOKENS（保存済みトークン文字列。setup_garmin_token.py で生成）
+  2. メール＋パスワード
+クラウドではトークン認証を強く推奨（毎回SSOログインするとブロックされやすいため）。
 
 実行例:
     python garmin_weekly_report.py
-スケジュール実行の方法は README.md を参照してください。
+スケジュール実行・クラウド化の方法は README.md を参照してください。
 """
 
 import configparser
@@ -32,41 +38,66 @@ _PLACEHOLDERS = {"", "XXXXXX", "XXXXXXXX",
                  "your_line_channel_access_token", "your_line_user_id"}
 
 
+def _get(env_key: str, cfg, section: str, option: str, default: str = "") -> str:
+    """環境変数を最優先、無ければ config.ini、それも無ければ default を返す。"""
+    v = os.getenv(env_key)
+    if v is not None and v.strip() != "":
+        return v
+    if cfg is not None:
+        return cfg.get(section, option, fallback=default)
+    return default
+
+
 def load_config():
-    """config.ini を読み込んで設定を返す。未設定があればエラーで停止。"""
-    if not os.path.exists(CONFIG_FILE):
+    """環境変数 → config.ini の順で設定を読み込む。必須項目が無ければエラーで停止。"""
+    cfg = None
+    if os.path.exists(CONFIG_FILE):
+        # interpolation=None: プロフィール内の「%」（例: 80%）をそのまま扱う
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(CONFIG_FILE, encoding="utf-8")
+
+    conf = {
+        # Garmin認証: トークン（推奨）か メール+パスワード
+        "garmin_tokens":   os.getenv("GARMIN_TOKENS", "").strip(),
+        "garmin_email":    _get("GARMIN_EMAIL", cfg, "garmin", "email"),
+        "garmin_password": _get("GARMIN_PASSWORD", cfg, "garmin", "password"),
+        # Gemini
+        "gemini_api_key":  _get("GEMINI_API_KEY", cfg, "gemini", "api_key"),
+        "gemini_model":    _get("GEMINI_MODEL", cfg, "gemini", "model", "gemini-2.5-flash"),
+        # LINE
+        "line_token":      _get("LINE_CHANNEL_ACCESS_TOKEN", cfg, "line", "channel_access_token"),
+        "line_user_id":    _get("LINE_USER_ID", cfg, "line", "user_id"),
+        # 目標・プロフィール
+        "goal_time":       _get("GOAL_MARATHON_TIME", cfg, "goal", "marathon_time", "3時間30分"),
+        "goal_pace":       _get("GOAL_RACE_PACE", cfg, "goal", "race_pace", "4:58/km"),
+        "runner_profile":  _get("RUNNER_PROFILE", cfg, "goal", "profile", "").strip(),
+    }
+
+    # プレースホルダのまま残っている値は未設定扱いにする
+    for k, v in conf.items():
+        if isinstance(v, str) and v.strip() in _PLACEHOLDERS:
+            conf[k] = ""
+    if not conf["gemini_model"]:
+        conf["gemini_model"] = "gemini-2.5-flash"
+
+    # 必須項目の検証
+    errs = []
+    if not conf["gemini_api_key"]:
+        errs.append("Gemini APIキー（GEMINI_API_KEY / [gemini]api_key）")
+    if not conf["line_token"]:
+        errs.append("LINEトークン（LINE_CHANNEL_ACCESS_TOKEN / [line]channel_access_token）")
+    if not conf["line_user_id"]:
+        errs.append("LINEユーザーID（LINE_USER_ID / [line]user_id）")
+    has_token = bool(conf["garmin_tokens"])
+    has_creds = bool(conf["garmin_email"] and conf["garmin_password"])
+    if not (has_token or has_creds):
+        errs.append("Garmin認証（GARMIN_TOKENS、または GARMIN_EMAIL ＋ GARMIN_PASSWORD）")
+
+    if errs:
         sys.exit(
-            f"❌ config.ini が見つかりません: {CONFIG_FILE}\n"
-            "   config.example.ini をコピーして config.ini を作成し、各自の値を記入してください。"
-        )
-
-    # interpolation=None: プロフィール内の「%」（例: 80%）をそのまま扱う
-    cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read(CONFIG_FILE, encoding="utf-8")
-
-    try:
-        conf = {
-            "garmin_email":    cfg.get("garmin", "email"),
-            "garmin_password": cfg.get("garmin", "password"),
-            "gemini_api_key":  cfg.get("gemini", "api_key"),
-            "gemini_model":    cfg.get("gemini", "model", fallback="gemini-2.5-flash"),
-            "line_token":      cfg.get("line", "channel_access_token"),
-            "line_user_id":    cfg.get("line", "user_id"),
-            "goal_time":       cfg.get("goal", "marathon_time", fallback="3時間30分"),
-            "goal_pace":       cfg.get("goal", "race_pace", fallback="4:58/km"),
-            "runner_profile":  cfg.get("goal", "profile", fallback="").strip(),
-        }
-    except (configparser.NoSectionError, configparser.NoOptionError) as e:
-        sys.exit(f"❌ config.ini の項目が不足しています: {e}\n   config.example.ini と見比べて確認してください。")
-
-    # 未記入（プレースホルダのまま）チェック
-    required = ["garmin_email", "garmin_password", "gemini_api_key",
-                "line_token", "line_user_id"]
-    missing = [k for k in required if conf[k].strip() in _PLACEHOLDERS]
-    if missing:
-        sys.exit(
-            "❌ config.ini に未記入の項目があります: " + ", ".join(missing) + "\n"
-            "   各APIキー・認証情報を記入してください（取得方法は README.md 参照）。"
+            "❌ 設定が不足しています:\n  - " + "\n  - ".join(errs)
+            + "\n\nローカルなら config.ini、クラウドなら環境変数(Secrets)で設定してください。"
+            "\n取得・設定方法は README.md を参照してください。"
         )
     return conf
 
@@ -74,6 +105,44 @@ def load_config():
 # ══════════════════════════════════════════════
 #  ユーティリティ
 # ══════════════════════════════════════════════
+def garmin_login(conf: dict):
+    """Garminにログイン。トークン優先、失敗時はメール/パスワードへフォールバック。"""
+    from garminconnect import Garmin
+
+    token = conf["garmin_tokens"]
+    has_creds = bool(conf["garmin_email"] and conf["garmin_password"])
+
+    if token:
+        log(f"Garmin: 保存済みトークンでログイン中...（トークン長 {len(token)} 文字）")
+        if len(token) <= 512:
+            log("⚠️ トークンが512文字以下です。login()がパス扱いになり失敗します。"
+                "トークンが途中までしかコピー/登録されていない可能性が高いです。")
+        if not (token.lstrip().startswith("{") and token.rstrip().endswith("}")):
+            log("⚠️ トークンが {\"di_token\":...} のJSON形式になっていません。"
+                "全文（先頭の { から末尾の } まで）が登録されているか確認してください。")
+        try:
+            garmin = Garmin()
+            garmin.login(token)
+            log("ログイン成功（トークン）")
+            return garmin
+        except Exception as e:
+            log(f"⚠️ トークンでのログインに失敗: {e}")
+            if not has_creds:
+                raise RuntimeError(
+                    "トークンでのログインに失敗しました。考えられる原因:\n"
+                    "  ① GARMIN_TOKENS が途中までしか登録されていない → 全文をコピーし直す\n"
+                    "     （JSON 1行。先頭 { ～ 末尾 } まで、通常1000文字以上）\n"
+                    "  ② トークンの有効期限切れ → トークンを再生成して更新\n"
+                    "  ③ 予備に GARMIN_EMAIL / GARMIN_PASSWORD を登録すると自動で切替可能"
+                ) from e
+            log("メール/パスワードでの再ログインを試みます...")
+
+    garmin = Garmin(conf["garmin_email"], conf["garmin_password"])
+    garmin.login()
+    log("ログイン成功（メール/パスワード）")
+    return garmin
+
+
 def log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -280,13 +349,9 @@ def main():
     log("=== 週次ランニングレポート（Gemini分析版）開始 ===")
     conf = load_config()
 
-    # ── Garmin ログイン ──────────────────────────────
+    # ── Garmin ログイン（トークン優先 / 失敗時は認証情報へ） ──
     try:
-        from garminconnect import Garmin
-        log("Garmin Connect にログイン中...")
-        garmin = Garmin(conf["garmin_email"], conf["garmin_password"])
-        garmin.login()
-        log("ログイン成功")
+        garmin = garmin_login(conf)
     except Exception as e:
         log(f"❌ Garminログインエラー: {e}")
         send_line_message(conf, f"⚠️ Garminログインエラー:\n{e}")

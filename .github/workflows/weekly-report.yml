@@ -1,0 +1,41 @@
+name: Weekly Running Report
+
+# 実行タイミング
+on:
+  schedule:
+    # GitHub Actions の cron は UTC 基準です。
+    # 日本時間（JST=UTC+9）月曜 07:00 → UTC 日曜 22:00
+    - cron: "0 22 * * 0"
+  workflow_dispatch:   # 手動実行ボタン（Actionsタブから今すぐ実行できる／動作確認用）
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: レポート実行
+        env:
+          # ── Secrets（Settings > Secrets and variables > Actions > Secrets）──
+          GARMIN_TOKENS:             ${{ secrets.GARMIN_TOKENS }}
+          GARMIN_EMAIL:              ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD:           ${{ secrets.GARMIN_PASSWORD }}
+          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID:              ${{ secrets.LINE_USER_ID }}
+          # ── Variables（任意。同画面の Variables タブ。秘密でない設定）──
+          GEMINI_MODEL:              ${{ vars.GEMINI_MODEL }}
+          GOAL_MARATHON_TIME:        ${{ vars.GOAL_MARATHON_TIME }}
+          GOAL_RACE_PACE:            ${{ vars.GOAL_RACE_PACE }}
+          RUNNER_PROFILE:            ${{ vars.RUNNER_PROFILE }}
+        run: python garmin_weekly_report.py

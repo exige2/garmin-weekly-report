@@ -350,6 +350,40 @@ def format_week_summary(week: dict) -> str:
     return "\n".join(lines)
 
 
+# 種別の日本語ラベルと絵文字
+_WTYPE_JP = {
+    "long": "ロング走", "interval": "インターバル", "tempo": "テンポ走",
+    "easy": "イージー", "recovery": "回復走", "race": "レース",
+}
+_WTYPE_EMOJI = {
+    "long": "🏃", "interval": "⚡", "tempo": "🔥",
+    "easy": "🌿", "recovery": "💤", "race": "🏁",
+}
+
+
+def format_week_types(runs: list) -> str:
+    """今週の各ランの種別をLINE表示用に整形（種別内訳＋1本ずつ）。"""
+    if not runs:
+        return ""
+    # 種別ごとの集計（出現順を保持）
+    tally = {}
+    for r in runs:
+        t = r.get("workout_type", "easy")
+        tally[t] = tally.get(t, 0) + 1
+    summary = " / ".join(f"{_WTYPE_JP.get(t, t)}{n}" for t, n in tally.items())
+
+    lines = ["🏷️ 今週の種別: " + summary]
+    for r in runs:
+        t     = r.get("workout_type", "easy")
+        emoji = _WTYPE_EMOJI.get(t, "")
+        date  = (r.get("date", "")[5:]).replace("-", "/")   # MM/DD
+        line  = f"  {emoji}{date} {_WTYPE_JP.get(t, t)} {r.get('distance_km', '')}km"
+        if r.get("avg_pace_per_km"):
+            line += f" {r['avg_pace_per_km']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime.date) -> dict:
     """
     LLMに渡す構造化データを組み立てる。
@@ -557,7 +591,11 @@ def main():
     # ── LINE 送信 ────────────────────────────────────
     try:
         header        = f"🏃 週次ランニングレポート\n📅 {today.strftime('%Y年%m月%d日')}\n\n"
-        summary_block = format_week_summary(weeks_data[0]) + "\n\n" + "─" * 14 + "\n\n"
+        summary_block = format_week_summary(weeks_data[0])
+        types_block   = format_week_types(this_week_runs)
+        if types_block:
+            summary_block += "\n\n" + types_block
+        summary_block += "\n\n" + "─" * 14 + "\n\n"
         message       = header + summary_block + report
         status, body  = send_line_message(conf, message)
         if status == 200:

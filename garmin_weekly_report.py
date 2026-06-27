@@ -166,6 +166,133 @@ def fetch_activities(client, start_date: datetime.date, end_date: datetime.date)
     )
 
 
+# ── 1ラン単位の解析（種別分類・ラップ・HRゾーン） ──────────────
+# 種別キーワード（アクティビティ名から判定。日本語・英語の両対応）
+_TYPE_KEYWORDS = [
+    ("interval", ["インターバル", "interval", "レペ", "rep", "ヤッソ", "yasso",
+                  "400", "800", "1000m", "ビルドアップ", "build"]),
+    ("tempo",    ["テンポ", "tempo", "閾値", "threshold", "ペース走", "lt走"]),
+    ("long",     ["ロング", "long", "lsd", "30k", "ロング走"]),
+    ("race",     ["レース", "race", "大会", "marathon", "マラソン", "ハーフ", "half"]),
+    ("recovery", ["リカバリー", "recovery", "回復", "regen", "リカバ"]),
+    ("easy",     ["イージー", "easy", "ジョグ", "jog"]),
+]
+
+
+def _pace_min_per_km(dist_m, dur_s):
+    if dist_m and dur_s and dist_m > 0:
+        return (dur_s / 60) / (dist_m / 1000)
+    return None
+
+
+def _extract_laps(splits: dict) -> list:
+    """get_activity_splits の戻りからラップ配列を取り出す（キー差異に頑健に対応）。"""
+    laps_raw = splits.get("lapDTOs") or splits.get("splits") or []
+    laps = []
+    for l in laps_raw:
+        dist = l.get("distance", 0) or 0
+        dur  = l.get("duration") or l.get("movingDuration") or l.get("elapsedDuration") or 0
+        hr   = l.get("averageHR") or l.get("avgHr")
+        laps.append({"dist_m": round(dist), "dur_s": round(dur),
+                     "avg_hr": int(hr) if hr else None})
+    return laps
+
+
+def classify_workout(act: dict, week_longest_m: float, laps: list) -> str:
+    """アクティビティ名・距離・ラップのペースばらつきからトレーニング種別を推定。"""
+    name = (act.get("activityName") or "").lower()
+    for label, kws in _TYPE_KEYWORDS:
+        if any(k.lower() in name for k in kws):
+            return label
+
+    dist = act.get("distance", 0) or 0
+    # ロング走: 18km以上、または週最長かつ15km以上
+    if dist >= 18000 or (week_longest_m and dist >= 0.95 * week_longest_m and dist >= 15000):
+        return "long"
+
+    # ラップ間ペース差で緩急（インターバル/変化走）を判定
+    paces = [p for p in (_pace_min_per_km(l["dist_m"], l["dur_s"]) for l in laps) if p]
+    if len(paces) >= 4:
+        spread = max(paces) - min(paces)
+        if spread >= 1.2:          # ラップ間で 1'12"/km 以上の差 → 緩急あり
+            return "interval"
+        if spread >= 0.5 and (act.get("averageHR") or 0) >= 150:
+            return "tempo"
+    return "easy"
+
+
+def _compact_laps(laps: list) -> list:
+    """ラップをLLM用にペース文字列＋心拍へ整形（緩急の評価用）。"""
+    out = []
+    for i, l in enumerate(laps, 1):
+        p = _pace_min_per_km(l["dist_m"], l["dur_s"])
+        item = {"lap": i, "dist_m": l["dist_m"]}
+        if p:
+            item["pace"] = format_pace(p)
+        if l.get("avg_hr"):
+            item["hr"] = l["avg_hr"]
+        out.append(item)
+    return out
+
+
+def summarize_activity(client, act: dict, week_longest_m: float) -> dict:
+    """1本のランを、種別・ラップ・HRゾーン込みで詳細化する。"""
+    aid  = act.get("activityId")
+    dist = act.get("distance", 0) or 0
+    dur  = act.get("duration", 0) or 0
+
+    rec = {
+        "date":        (act.get("startTimeLocal") or "")[:10],
+        "name":        act.get("activityName") or "",
+        "distance_km": round(dist / 1000, 2),
+        "duration_min": round(dur / 60, 1),
+    }
+    p = _pace_min_per_km(dist, dur)
+    if p:
+        rec["avg_pace_per_km"] = format_pace(p)
+    if act.get("averageHR"):
+        rec["avg_hr"] = int(act["averageHR"])
+    if act.get("maxHR"):
+        rec["max_hr"] = int(act["maxHR"])
+    cad = act.get("averageRunningCadenceInStepsPerMinute")
+    if cad:
+        rec["cadence_spm"] = int(cad)
+    if act.get("elevationGain"):
+        rec["elevation_m"] = int(act["elevationGain"])
+    # トレーニング効果（取得できる場合）
+    if act.get("aerobicTrainingEffect") is not None:
+        rec["aerobic_te"] = round(act["aerobicTrainingEffect"], 1)
+    if act.get("anaerobicTrainingEffect") is not None:
+        rec["anaerobic_te"] = round(act["anaerobicTrainingEffect"], 1)
+
+    # ラップ取得（種別判定と緩急評価に使用）
+    laps = []
+    try:
+        laps = _extract_laps(client.get_activity_splits(aid))
+    except Exception as e:
+        log(f"  ラップ取得スキップ (id={aid}): {e}")
+
+    rec["workout_type"] = classify_workout(act, week_longest_m, laps)
+
+    # HRゾーン配分（80/20分析用）
+    try:
+        zones = client.get_activity_hr_in_timezones(aid) or []
+        total = sum(z.get("secsInZone", 0) for z in zones)
+        if total > 0:
+            rec["hr_zone_pct"] = {
+                f"z{z.get('zoneNumber')}": round(100 * z.get("secsInZone", 0) / total)
+                for z in zones if z.get("zoneNumber")
+            }
+    except Exception as e:
+        log(f"  HRゾーン取得スキップ (id={aid}): {e}")
+
+    # ラップは質練習・ロング・レースのみ payload に含める（トークン節約）
+    if rec["workout_type"] in ("interval", "tempo", "long", "race") and laps:
+        rec["laps"] = _compact_laps(laps)
+
+    return rec
+
+
 def summarize_week(activities: list, label: str) -> dict:
     """1週分のアクティビティを集計してdictで返す"""
     if not activities:
@@ -223,12 +350,16 @@ def format_week_summary(week: dict) -> str:
     return "\n".join(lines)
 
 
-def build_payload(conf: dict, weeks: list, today: datetime.date) -> dict:
+def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime.date) -> dict:
     """
     LLMに渡す構造化データを組み立てる。
 
     生データ（FIT時系列）は渡さず、コード側で集計した値とランナープロファイルのみを
     構造化JSONとして渡す。これによりトークンを節約し、無料枠内で安定動作させる。
+
+    this_week_runs: 今週の「1ラン単位」の詳細（種別・ラップ・HRゾーン込み）。
+                    これにより種別ごとの具体的な講評が可能になる。
+    weeks_recent_first: 週次の集計（トレンド把握用の文脈）。
     """
     week_records = []
     for w in weeks:
@@ -261,6 +392,7 @@ def build_payload(conf: dict, weeks: list, today: datetime.date) -> dict:
             "goal_race_pace": conf["goal_pace"],
             "notes":          conf["runner_profile"],
         },
+        "this_week_runs":     this_week_runs,
         "weeks_recent_first": week_records,
     }
 
@@ -268,22 +400,31 @@ def build_payload(conf: dict, weeks: list, today: datetime.date) -> dict:
 def analyze_with_llm(conf: dict, payload: dict) -> str:
     """Gemini API でトレーニングデータを分析してレポートを生成"""
     system_prompt = """あなたは経験豊富なランニングコーチです。
-与えられたGarminトレーニングデータ（構造化JSON）とランナープロファイルに基づき、
-目標達成に向けた具体的で実践的なアドバイスを日本語で提供してください。
+入力JSONには分析日、ランナープロファイル(runner_profile)、今週の各ランの詳細(this_week_runs)、
+週次の推移(weeks_recent_first) が含まれます。
 
-入力JSONの weeks_recent_first は直近週が先頭、配列順に過去へ遡ります。
-ran=false の週はランニング実施なしを意味します。
+this_week_runs の各ランには次の情報があります:
+- workout_type: long(ロング走)/interval(インターバル)/tempo(テンポ・閾値)/easy(イージー)/recovery(回復走)/race(レース)
+- avg_pace_per_km, avg_hr, max_hr, cadence_spm, elevation_m
+- hr_zone_pct: 心拍ゾーン別の時間配分(%)
+- laps: 質練習・ロングのみ。各ラップの距離・ペース・心拍（緩急やラップの揃い方の評価に使う）
 
-レポートはLINEメッセージとして送信されます。
-絵文字を適度に使い、読みやすくモチベーションが上がる内容にし、合計700文字以内に収めてください。
-プレーンテキストで出力し、Markdown記法やコードブロックは使わないでください。
+【最重要】各ランを1本ずつ、種別に応じた観点で講評してください。
+良かった点に加えて「具体的な改善ポイント」を必ず述べ、ペースや心拍などの数値を根拠として引用すること。
+種別ごとの着眼点:
+- ロング走: 後半の失速(ポジティブスプリット)有無、心拍ドリフト、距離の妥当性、目標レースペース対比
+- インターバル: ラップの揃い方/終盤の失速、設定ペース達成度、本数、心拍の上がり方
+- テンポ/閾値: 設定ペースの維持、心拍が閾値域に収まっているか
+- イージー/回復走: 強度が上がりすぎていないか(hr_zone_pctでゾーン2中心か)、80/20の遵守
 
-構成：
+日本語・プレーンテキスト・絵文字を適度に使い、最大1500文字。Markdownやコードブロックは使わない。
+
+構成:
 1. 今週のサマリー（一言評価）
-2. 先週との比較・トレンド
-3. 目標への進捗評価（目標ペース・距離・心拍ゾーンの観点から）
-4. 来週のトレーニング提案（具体的に1〜2点）
-5. 一言コーチングメッセージ"""
+2. 各ランの講評（1本ずつ。種別を明記し、良かった点＋具体的改善ポイントを数値根拠つきで）
+3. 週全体のバランス（強度配分・80/20、距離・質のバランス）
+4. 目標(goal_time/goal_race_pace)への進捗評価
+5. 来週の具体的提案（練習メニューを1〜2本、ペース付きで）"""
 
     user_text = (
         "以下のトレーニングデータ（JSON）を分析してください。\n\n"
@@ -300,10 +441,10 @@ ran=false の週はランニング実施なしを意味します。
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": {
             "temperature": 0.4,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
             # 2.5 Flash は思考(thinking)が標準ON。思考トークンが maxOutputTokens を
             # 消費し本文が途中で切れるため、思考を無効化(0)して全枠を出力に充てる。
-            # 分析を厚くしたい場合は 0→512 等にし、maxOutputTokens も併せて増やす。
+            # 各ランの講評で出力が長くなるため上限を増やしている。
             "thinkingConfig": {"thinkingBudget": 0},
         },
     }
@@ -361,6 +502,7 @@ def main():
     try:
         today      = datetime.date.today()
         weeks_data = []
+        this_week_acts = []
 
         for i in range(4):
             # 直近週から順に4週分（月〜日で区切り）
@@ -369,6 +511,8 @@ def main():
             label      = ("今週" if i == 0 else f"{i}週前") + \
                          f"（{week_start.strftime('%m/%d')}〜{week_end.strftime('%m/%d')}）"
             acts = fetch_activities(garmin, week_start, week_end)
+            if i == 0:
+                this_week_acts = acts
             weeks_data.append(summarize_week(acts, label))
             log(f"取得: {label} → {weeks_data[-1]['count']}件 / {weeks_data[-1]['distance_km']}km")
 
@@ -377,10 +521,24 @@ def main():
         send_line_message(conf, f"⚠️ Garminデータ取得エラー:\n{e}")
         sys.exit(1)
 
+    # ── 今週の各ランを1本ずつ詳細化（種別・ラップ・HRゾーン） ──
+    this_week_runs = []
+    try:
+        week_longest_m = max((a.get("distance", 0) or 0 for a in this_week_acts), default=0)
+        # 日付順（古い→新しい）に並べて詳細化
+        for a in sorted(this_week_acts, key=lambda x: x.get("startTimeLocal") or ""):
+            run = summarize_activity(garmin, a, week_longest_m)
+            this_week_runs.append(run)
+            log(f"  詳細: {run['date']} {run['workout_type']} "
+                f"{run['distance_km']}km {run.get('avg_pace_per_km','-')}")
+    except Exception as e:
+        # 詳細化に失敗しても週次集計だけで続行する
+        log(f"⚠️ 各ラン詳細化でエラー（週次集計のみで続行）: {e}")
+
     # ── LLM 分析 ────────────────────────────────────
     try:
         log(f"Gemini API（{conf['gemini_model']}）で分析中...")
-        payload = build_payload(conf, weeks_data, today)
+        payload = build_payload(conf, weeks_data, this_week_runs, today)
         log("── 送信データ（JSON） ──")
         for line in json.dumps(payload, ensure_ascii=False, indent=2).split("\n"):
             log(line)

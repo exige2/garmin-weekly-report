@@ -69,23 +69,26 @@ PCがなくても、**スマホのブラウザだけ**でセットアップで�
 
 1. 作成されたリポジトリを開く
 2. **Settings → Secrets and variables → Actions**
-3. **Secrets** タブで次の4つを登録（「New repository secret」）:
+3. **Secrets** タブで次を登録（「New repository secret」）:
 
    | Name | Value |
    |------|-------|
-   | `GARMIN_TOKENS` | 手順2で生成（ノートブック最後のセルで再表示できます） |
-   | `GARMIN_EMAIL` | ログインメールアドレス |
-   | `GARMIN_PASSWORD` | ログインパスワード |
+   | `GARMIN_TOKENS` | 手順2で生成（ノートブック最後のセルで再表示できます）|
+   | `GARMIN_EMAIL` | Garminのメールアドレス（予備・推奨）|
+   | `GARMIN_PASSWORD` | Garminのパスワード（予備・推奨）|
    | `GEMINI_API_KEY` | Gemini APIキー |
    | `LINE_CHANNEL_ACCESS_TOKEN` | LINEチャネルアクセストークン |
    | `LINE_USER_ID` | LINEユーザーID |
-   ※Garmin_TOKENSだけでも、認証はできる想定でしたが、2週目でエラーになってしまったので、Garmin_EMAIL,Passwordを追加しました。
-   いずれかの方法で、ログインでき、Garminからデータが取得できるはずです。
 
-5. （任意）**Variables** タブで目標を登録:
+   > **`GARMIN_EMAIL` と `GARMIN_PASSWORD` も登録しておくのがおすすめです。**
+   > トークンだけだと、Garminのレート制限や期限切れで
+   > `Failed to retrieve social profile` エラーになることがあります。
+   > この2つがあると、トークン失敗時に自動でメール/パスワード認証に切り替わり止まりにくくなります。
+
+4. （任意）**Variables** タブで目標を登録:
    `GOAL_MARATHON_TIME` / `GOAL_RACE_PACE` / `RUNNER_PROFILE` / `GEMINI_MODEL`
-6. **Actions** タブでワークフローを有効化
-7. 「Weekly Running Report」→「**Run workflow**」で手動実行 → LINEに届けば完了 🎉
+5. **Actions** タブでワークフローを有効化
+6. 「Weekly Running Report」→「**Run workflow**」で手動実行 → LINEに届けば完了 🎉
 
 以降は毎週月曜 7:00（日本時間）に自動でレポートが届きます。
 
@@ -110,6 +113,7 @@ Colabを使わずGitHubのブラウザ操作だけでも可能です（やや手
 | 症状 | 対処 |
 |------|------|
 | 手順2でGarminログイン失敗 | 数分待って再実行。続く場合はPCを一度だけ借りて `setup_garmin_token.py` |
+| `Failed to retrieve social profile` | Garminのレート制限/期限切れ。数時間おいてトークン再生成し `GARMIN_TOKENS` 更新。`GARMIN_EMAIL`/`GARMIN_PASSWORD` も登録しておくと自動で切替 |
 | 手順3で 401/403 | PATのスコープに **repo** と **workflow** が入っているか確認 |
 | 手順3で workflow ファイルだけ失敗 | PATに **workflow** スコープが必要 |
 | LINEに届かない | Botを友だち追加したか／`LINE_USER_ID` が正しいか |

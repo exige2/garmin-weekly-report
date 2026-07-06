@@ -278,13 +278,20 @@ python setup_garmin_token.py        # Windowsは python、Macは python3
 
 | 名前 | 値 |
 |------|----|
-| `GARMIN_TOKENS` | 6-1で生成したトークン文字列 |
+| `GARMIN_TOKENS` | 6-1で生成したトークン文字列（主）|
+| `GARMIN_EMAIL` | Garminのメールアドレス（予備・推奨）|
+| `GARMIN_PASSWORD` | Garminのパスワード（予備・推奨）|
 | `GEMINI_API_KEY` | Gemini APIキー |
 | `LINE_CHANNEL_ACCESS_TOKEN` | LINEチャネルアクセストークン |
 | `LINE_USER_ID` | 自分のLINEユーザーID |
 
-> トークンを使わずメール/パスワードで運用する場合は、代わりに `GARMIN_EMAIL` と
-> `GARMIN_PASSWORD` を登録します（クラウドではブロックされやすいため非推奨）。
+> **`GARMIN_EMAIL` と `GARMIN_PASSWORD` も登録することを推奨します。**
+> トークンだけだと、Garmin側のレート制限やトークン期限切れで
+> `Failed to retrieve social profile` 等のエラーになることがあります。
+> この2つを登録しておくと、トークンでのログインが失敗したとき
+> 自動的にメール/パスワードでのログインに切り替わり、止まりにくくなります。
+> （メール/パスワード単独運用も可能ですが、クラウドIPは弾かれやすいため、
+> トークンを主・メール/パスワードを予備にする構成が最も安定します）
 
 **Variables（秘密でない設定）タブ**（任意・未設定でも既定値で動きます）:
 
@@ -356,6 +363,7 @@ python setup_garmin_token.py        # Windowsは python、Macは python3
 | `config.ini が見つかりません` | `config.example.ini` をコピーして `config.ini` を作成 |
 | `未記入の項目があります` | 該当項目に正しい値を記入（プレースホルダのまま残っている） |
 | Garminログインエラー | メール/パスワードを確認。MFA有効だと失敗することあり。`pip install --upgrade garminconnect curl_cffi ua-generator` で最新化 |
+| `Failed to retrieve social profile` | Garmin側のレート制限(429)/トークン期限切れ。数時間おいて `setup_garmin_token.py` でトークン再生成し `GARMIN_TOKENS` を更新（連打しない）。`GARMIN_EMAIL`/`GARMIN_PASSWORD` を登録しておくと自動でメール/パスワード認証に切替 |
 | LINEに届かない | Botを**友だち追加**したか、`user_id`（U始まり）が正しいか確認 |
 | レポートが途中で切れる | `garmin_report.log` に `MAX_TOKENS` 警告が出ていないか確認（本ツールは思考OFF設定済み） |
 | Gemini 429エラー | 無料枠のレート上限。少し待つか、課金有効化で上限引き上げ |

@@ -74,14 +74,18 @@ PCがなくても、**スマホのブラウザだけ**でセットアップで�
    | Name | Value |
    |------|-------|
    | `GARMIN_TOKENS` | 手順2で生成（ノートブック最後のセルで再表示できます） |
+   | `GARMIN_EMAIL` | ログインメールアドレス |
+   | `GARMIN_PASSWORD` | ログインパスワード |
    | `GEMINI_API_KEY` | Gemini APIキー |
    | `LINE_CHANNEL_ACCESS_TOKEN` | LINEチャネルアクセストークン |
    | `LINE_USER_ID` | LINEユーザーID |
+   ※Garmin_TOKENSだけでも、認証はできる想定でしたが、2週目でエラーになってしまったので、Garmin_EMAIL,Passwordを追加しました。
+   いずれかの方法で、ログインでき、Garminからデータが取得できるはずです。
 
-4. （任意）**Variables** タブで目標を登録:
+5. （任意）**Variables** タブで目標を登録:
    `GOAL_MARATHON_TIME` / `GOAL_RACE_PACE` / `RUNNER_PROFILE` / `GEMINI_MODEL`
-5. **Actions** タブでワークフローを有効化
-6. 「Weekly Running Report」→「**Run workflow**」で手動実行 → LINEに届けば完了 🎉
+6. **Actions** タブでワークフローを有効化
+7. 「Weekly Running Report」→「**Run workflow**」で手動実行 → LINEに届けば完了 🎉
 
 以降は毎週月曜 7:00（日本時間）に自動でレポートが届きます。
 

@@ -21,6 +21,7 @@ import configparser
 import datetime
 import json
 import os
+import re
 import sys
 
 import requests
@@ -106,7 +107,12 @@ def load_config():
 #  ユーティリティ
 # ══════════════════════════════════════════════
 def garmin_login(conf: dict):
-    """Garminにログイン。トークン優先、失敗時はメール/パスワードへフォールバック。"""
+    """Garminにログイン。トークン優先、失敗時はメール/パスワードへフォールバック。
+
+    Garmin側の一時的なレート制限(429)/セッション更新失敗に備え、
+    トークンログインは待機付きで数回リトライする。
+    """
+    import time
     from garminconnect import Garmin
 
     token = conf["garmin_tokens"]
@@ -120,22 +126,36 @@ def garmin_login(conf: dict):
         if not (token.lstrip().startswith("{") and token.rstrip().endswith("}")):
             log("⚠️ トークンが {\"di_token\":...} のJSON形式になっていません。"
                 "全文（先頭の { から末尾の } まで）が登録されているか確認してください。")
-        try:
-            garmin = Garmin()
-            garmin.login(token)
-            log("ログイン成功（トークン）")
-            return garmin
-        except Exception as e:
-            log(f"⚠️ トークンでのログインに失敗: {e}")
-            if not has_creds:
-                raise RuntimeError(
-                    "トークンでのログインに失敗しました。考えられる原因:\n"
-                    "  ① GARMIN_TOKENS が途中までしか登録されていない → 全文をコピーし直す\n"
-                    "     （JSON 1行。先頭 { ～ 末尾 } まで、通常1000文字以上）\n"
-                    "  ② トークンの有効期限切れ → トークンを再生成して更新\n"
-                    "  ③ 予備に GARMIN_EMAIL / GARMIN_PASSWORD を登録すると自動で切替可能"
-                ) from e
-            log("メール/パスワードでの再ログインを試みます...")
+
+        attempts   = 3
+        base_delay = 30   # 秒。429は待つと解けることが多いので指数的に延ばす
+        last_err   = None
+        for i in range(1, attempts + 1):
+            try:
+                garmin = Garmin()
+                garmin.login(token)
+                log(f"ログイン成功（トークン, 試行{i}）")
+                return garmin
+            except Exception as e:
+                last_err = e
+                log(f"⚠️ トークンでのログイン失敗（試行{i}/{attempts}）: {e}")
+                if i < attempts:
+                    delay = base_delay * i
+                    log(f"  {delay}秒待って再試行します（Garminのレート制限対策）...")
+                    time.sleep(delay)
+
+        # ここまで来たらトークンでの全試行が失敗
+        if not has_creds:
+            raise RuntimeError(
+                "トークンでのログインに失敗しました。考えられる原因:\n"
+                "  ① Garmin側のレート制限(429)/一時ブロック\n"
+                "     → 数時間おいてトークンを再生成し GARMIN_TOKENS を更新（連打しない）\n"
+                "  ② トークンの有効期限切れ → 再生成して更新\n"
+                "  ③ GARMIN_TOKENS が途中までしか登録されていない → 全文をコピーし直す\n"
+                "  ④ 予備に GARMIN_EMAIL / GARMIN_PASSWORD を登録すると自動で切替可能\n"
+                f"（最後のエラー: {last_err}）"
+            ) from last_err
+        log("メール/パスワードでの再ログインを試みます...")
 
     garmin = Garmin(conf["garmin_email"], conf["garmin_password"])
     garmin.login()
@@ -383,9 +403,14 @@ def summarize_week(activities: list, label: str) -> dict:
 
 def format_week_summary(week: dict) -> str:
     """今週の集計値をLINE表示用のテキストブロックに整形"""
+    # week["label"] は「対象週（07/06〜07/12）」形式。期間部分を見出しに出す。
+    rng = ""
+    if week.get("label") and "（" in week["label"]:
+        rng = week["label"][week["label"].index("（"):]
+    head = f"📊 対象週のサマリー {rng}".rstrip()
     if week["count"] == 0:
-        return "📊 今週のサマリー\n  今週はランニングなし"
-    lines = ["📊 今週のサマリー"]
+        return head + "\n  この週はランニングなし"
+    lines = [head]
     lines.append(f"  走行回数   : {week['count']} 回")
     lines.append(f"  総距離     : {week['distance_km']} km")
     lines.append(f"  最長ラン   : {week['max_distance_km']} km")
@@ -423,7 +448,7 @@ def format_week_types(runs: list) -> str:
         tally[t] = tally.get(t, 0) + 1
     summary = " / ".join(f"{_WTYPE_JP.get(t, t)}{n}" for t, n in tally.items())
 
-    lines = ["🏷️ 今週の種別: " + summary]
+    lines = ["🏷️ 種別内訳: " + summary]
     for r in runs:
         t     = r.get("workout_type", "easy")
         emoji = _WTYPE_EMOJI.get(t, "")
@@ -433,6 +458,80 @@ def format_week_types(runs: list) -> str:
             line += f" {r['avg_pace_per_km']}"
         lines.append(line)
     return "\n".join(lines)
+
+
+_WD_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def parse_upcoming_races(profile: str, today: datetime.date, limit: int = 3) -> list:
+    """ランナープロフィール文から予定レースを抽出し、日付・曜日・残り日数を計算する。
+
+    LLMに日付計算をさせると曜日やレース日を取り違えるため、コード側で確定させて渡す。
+    対応表記例: 「7月26日赤城トレイルラン 30k」「11月3日 群馬マラソン」「2027年1月 …」
+    """
+    races = []
+    if not profile:
+        return races
+
+    for line in profile.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 「(年)月日」形式を拾う（年は省略可）
+        m = re.search(r"(?:(\d{4})年)?\s*(\d{1,2})月\s*(\d{1,2})日", line)
+        if not m:
+            continue
+        year, mon, day = m.group(1), int(m.group(2)), int(m.group(3))
+
+        if year:
+            y = int(year)
+        else:
+            # 年の記載がなければ、今日以降で最も近い年を採用
+            y = today.year
+            try:
+                if datetime.date(y, mon, day) < today:
+                    y += 1
+            except ValueError:
+                continue
+        try:
+            d = datetime.date(y, mon, day)
+        except ValueError:
+            continue
+
+        if d < today:      # 過去のレース（実績）は除外
+            continue
+
+        # レース名 = 日付表記を除いた行の残り（先頭の記号を削る）
+        name = (line[:m.start()] + line[m.end():]).strip(" 　-・:：")
+        races.append({
+            "name":         name or line,
+            "date":         d.isoformat(),
+            "weekday":      _WD_JP[d.weekday()],
+            "days_until":   (d - today).days,
+            "weeks_until":  round((d - today).days / 7, 1),
+        })
+
+    races.sort(key=lambda r: r["date"])
+    return races[:limit]
+
+
+def build_next_week_calendar(today: datetime.date) -> dict:
+    """来週プラン用の各日を「日付＋曜日」で明示。LLMの曜日誤りを防ぐ。
+
+    実行は日曜夜〜月曜朝で、レポート対象は直前に終わった週(月〜日)。
+    その「翌週＝実行日を含む週の月曜〜日曜」をプラン対象にする。
+    月曜実行なら、その月曜から始まる1週間。
+    """
+    start = today - datetime.timedelta(days=today.weekday())  # 実行日を含む週の月曜
+    days = []
+    for i in range(7):
+        d = start + datetime.timedelta(days=i)
+        days.append({"date": d.isoformat(), "weekday": _WD_JP[d.weekday()]})
+    return {
+        "from": start.isoformat(),
+        "to":   (start + datetime.timedelta(days=6)).isoformat(),
+        "days": days,
+    }
 
 
 def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime.date) -> dict:
@@ -472,6 +571,12 @@ def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime
 
     return {
         "analysis_date": today.strftime("%Y-%m-%d"),
+        "analysis_weekday": _WD_JP[today.weekday()],
+        "target_week": weeks[0]["label"] if weeks else "",
+        # レース日・曜日・残り日数はコード側で確定して渡す（LLMに日付計算させない）
+        "upcoming_races": parse_upcoming_races(conf["runner_profile"], today),
+        # 来週の各日の曜日も明示（曜日の取り違え防止）
+        "next_week_calendar": build_next_week_calendar(today),
         "runner_profile": {
             "goal_time":      conf["goal_time"],
             "goal_race_pace": conf["goal_pace"],
@@ -485,8 +590,23 @@ def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime
 def analyze_with_llm(conf: dict, payload: dict) -> str:
     """Gemini API でトレーニングデータを分析してレポートを生成"""
     system_prompt = """あなたは経験豊富なランニングコーチです。
-入力JSONには分析日、ランナープロファイル(runner_profile)、今週の各ランの詳細(this_week_runs)、
-週次の推移(weeks_recent_first) が含まれます。
+入力JSONには分析日(analysis_date)、対象週(target_week)、ランナープロファイル(runner_profile)、
+対象週の各ランの詳細(this_week_runs)、週次の推移(weeks_recent_first) が含まれます。
+
+【重要】レポートの対象は analysis_date（実行日）ではなく、直近で終了した月〜日の1週間である
+target_week です。this_week_runs は target_week に行われた練習です。
+「今週」と書く場合は target_week（例: 07/06〜07/12）を指し、その日付範囲をレポート冒頭に明記すること。
+「来週のプラン」は next_week_calendar の範囲（実行日を含む週の月曜〜日曜）を指します。
+必ず月曜(from)から始め、月曜〜日曜の7日分すべてに触れること（休養日も明記）。
+
+【日付・曜日の絶対ルール】日付や曜日を自分で計算・推測してはいけません。必ず入力JSONの値をそのまま使うこと。
+- upcoming_races: 今後のレース。name/date/weekday/days_until が確定値として与えられます。
+  レース日と曜日は必ずこの値を使い、勝手に別の日付に置き換えないこと。
+  レースが来週(next_week_calendar の範囲)に無い場合は、来週のプランにレースを入れてはいけません。
+  その場合は「レースまであとX日」として、それに向けた調整段階の練習を提案すること。
+- next_week_calendar: 来週の各日の日付と曜日が与えられます。曜日はこの通りに書くこと。
+  練習メニューを曜日ごとに書く際は、この日付と曜日の対応を必ず守ること。
+- upcoming_races が空なら、特定のレースには言及しないこと。
 
 this_week_runs の各ランには次の情報があります:
 - workout_type: long(ロング走)/interval(インターバル)/tempo(テンポ・閾値)/easy(イージー)/recovery(回復走)/race(レース)
@@ -510,9 +630,12 @@ this_week_runs の各ランには次の情報があります:
 3. 週全体のバランス（強度配分・80/20、距離・質のバランス）
 4. 目標(goal_time/goal_race_pace)への進捗評価
 5. 来週のトレーニングプラン ← 具体的に、次を必ず含めること:
+   - next_week_calendar の月曜(from)から日曜(to)までの1週間を対象にする（火曜始まりにしない）
    - 推奨頻度: 週何回走るか（休養日の配置も）
    - 目標距離: 来週の合計距離の目安（runner_profileの週間距離目標と、今週の実績・残り週数を踏まえる）
    - 練習メニュー: 主要練習を曜日ごとに、種別・距離・ペース・本数まで具体的に提示する
+     （曜日・日付は next_week_calendar の値をそのまま使うこと。レースは upcoming_races に
+       来週該当のものがある場合のみ入れる）
      例)「火: インターバル 1000m×5（4'30"/km, レスト200mジョグ）」「日: ロング走 24km（5'10"/km）」
        「他: イージー 8km（6'00"/km）を2回」
    - 80/20の強度配分を意識し、今週の課題（各ランの講評で挙げた点）を補う内容にすること"""
@@ -540,7 +663,22 @@ this_week_runs の各ランには次の情報があります:
         },
     }
 
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
+    # Gemini側の一時的な障害(503/500/429)は待って再試行する
+    import time
+    attempts   = 4
+    base_delay = 15   # 秒。503は少し待つと解消することが多い
+    resp = None
+    for i in range(1, attempts + 1):
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        if resp.status_code < 400:
+            break
+        # リトライ対象: 429(レート)/500/502/503/504(一時障害)
+        if resp.status_code in (429, 500, 502, 503, 504) and i < attempts:
+            delay = base_delay * i
+            log(f"⚠️ Gemini {resp.status_code}（試行{i}/{attempts}）。{delay}秒待って再試行...")
+            time.sleep(delay)
+            continue
+        break
     resp.raise_for_status()
     data = resp.json()
 
@@ -591,15 +729,26 @@ def main():
 
     # ── 過去4週のデータ取得 ──────────────────────────
     try:
-        today      = datetime.date.today()
+        # GitHubランナーはUTCで動くため、日本時間で「今日」を求める
+        # （月曜8:25 JST 実行はUTCでは日曜23:25。UTC日付だと1日ずれる）。
+        # 日本はサマータイムが無いので固定 +9時間で確実。
+        JST        = datetime.timezone(datetime.timedelta(hours=9))
+        today      = datetime.datetime.now(JST).date()
         weeks_data = []
         this_week_acts = []
 
+        # 「対象週」= 直近で完了した月〜日の週（曜日に依存せず正しく選ぶ）。
+        # weekday(): 月=0 ... 日=6
+        #   月曜(0)実行 → 昨日(日)で終わった先週が対象
+        #   火〜日実行 → 「今日を含む週」はまだ終わっていないので、その1つ前の完了週が対象
+        # 実装: 今日を含む週の月曜を求め、そこから7日引いた月曜を対象週の頭にする。
+        this_week_monday = today - datetime.timedelta(days=today.weekday())
+        target_monday    = this_week_monday - datetime.timedelta(days=7)
+
         for i in range(4):
-            # 直近週から順に4週分（月〜日で区切り）
-            week_end   = today - datetime.timedelta(days=7 * i)
-            week_start = week_end - datetime.timedelta(days=6)
-            label      = ("今週" if i == 0 else f"{i}週前") + \
+            week_start = target_monday - datetime.timedelta(days=7 * i)
+            week_end   = week_start + datetime.timedelta(days=6)
+            label      = ("対象週" if i == 0 else f"{i}週前") + \
                          f"（{week_start.strftime('%m/%d')}〜{week_end.strftime('%m/%d')}）"
             acts = fetch_activities(garmin, week_start, week_end)
             if i == 0:

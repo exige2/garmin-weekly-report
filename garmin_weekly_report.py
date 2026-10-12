@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Garmin Connect 週次ランニングレポート（LLM分析版 / Gemini Flash）
+Garmin Connect 週次ランニングレポート（LLM分析版 / Gemini Flash-Lite）
 Gemini API でトレーニングを分析し、目標達成に向けた進捗をLINEに通知します。
 
 設定の読み込み順は「環境変数（GitHub Secrets等）→ config.ini」です。
@@ -64,7 +64,8 @@ def load_config():
         "garmin_password": _get("GARMIN_PASSWORD", cfg, "garmin", "password"),
         # Gemini
         "gemini_api_key":  _get("GEMINI_API_KEY", cfg, "gemini", "api_key"),
-        "gemini_model":    _get("GEMINI_MODEL", cfg, "gemini", "model", "gemini-2.5-flash"),
+        # 空なら実行時に最新の Flash-Lite を自動選択（resolve_gemini_model）
+        "gemini_model":    _get("GEMINI_MODEL", cfg, "gemini", "model", ""),
         # LINE
         "line_token":      _get("LINE_CHANNEL_ACCESS_TOKEN", cfg, "line", "channel_access_token"),
         "line_user_id":    _get("LINE_USER_ID", cfg, "line", "user_id"),
@@ -78,8 +79,7 @@ def load_config():
     for k, v in conf.items():
         if isinstance(v, str) and v.strip() in _PLACEHOLDERS:
             conf[k] = ""
-    if not conf["gemini_model"]:
-        conf["gemini_model"] = "gemini-2.5-flash"
+    conf["gemini_model"] = conf["gemini_model"].strip()
 
     # 必須項目の検証
     errs = []
@@ -407,22 +407,22 @@ def format_week_summary(week: dict) -> str:
     rng = ""
     if week.get("label") and "（" in week["label"]:
         rng = week["label"][week["label"].index("（"):]
-    head = f"📊 対象週のサマリー {rng}".rstrip()
+    # LINEはプロポーショナルフォントで空白揃えが崩れるため、「・項目 値」の短い行にする
+    head = f"📊【対象週のサマリー】\n{rng.strip('（）')}".rstrip()
     if week["count"] == 0:
-        return head + "\n  この週はランニングなし"
+        return head + "\n・この週はランニングなし"
     lines = [head]
-    lines.append(f"  走行回数   : {week['count']} 回")
-    lines.append(f"  総距離     : {week['distance_km']} km")
-    lines.append(f"  最長ラン   : {week['max_distance_km']} km")
-    lines.append(f"  総時間     : {int(week['duration_min'])} 分")
+    lines.append(f"・{week['count']}回 / {week['distance_km']}km")
+    lines.append(f"・最長 {week['max_distance_km']}km")
+    lines.append(f"・総時間 {int(week['duration_min'])}分")
     if week["avg_pace"]:
-        lines.append(f"  平均ペース : {format_pace(week['avg_pace'])} /km")
+        lines.append(f"・平均 {format_pace(week['avg_pace'])}/km")
     if week["avg_hr"]:
-        lines.append(f"  平均心拍   : {int(week['avg_hr'])} bpm")
+        lines.append(f"・心拍 {int(week['avg_hr'])}bpm")
     if week["avg_cadence"]:
-        lines.append(f"  ケイデンス : {int(week['avg_cadence'])} spm")
+        lines.append(f"・ケイデンス {int(week['avg_cadence'])}spm")
     if week["elevation_m"] > 0:
-        lines.append(f"  獲得標高   : {int(week['elevation_m'])} m")
+        lines.append(f"・獲得標高 {int(week['elevation_m'])}m")
     return "\n".join(lines)
 
 
@@ -448,12 +448,12 @@ def format_week_types(runs: list) -> str:
         tally[t] = tally.get(t, 0) + 1
     summary = " / ".join(f"{_WTYPE_JP.get(t, t)}{n}" for t, n in tally.items())
 
-    lines = ["🏷️ 種別内訳: " + summary]
+    lines = ["🏷️【種別内訳】", summary]
     for r in runs:
         t     = r.get("workout_type", "easy")
         emoji = _WTYPE_EMOJI.get(t, "")
         date  = (r.get("date", "")[5:]).replace("-", "/")   # MM/DD
-        line  = f"  {emoji}{date} {_WTYPE_JP.get(t, t)} {r.get('distance_km', '')}km"
+        line  = f"{emoji}{date} {_WTYPE_JP.get(t, t)} {r.get('distance_km', '')}km"
         if r.get("avg_pace_per_km"):
             line += f" {r['avg_pace_per_km']}"
         lines.append(line)
@@ -587,6 +587,51 @@ def build_payload(conf: dict, weeks: list, this_week_runs: list, today: datetime
     }
 
 
+GEMINI_API_BASE        = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_FALLBACK_MODEL  = "gemini-3.5-flash-lite"   # モデル一覧が取れなかった時の予備
+# テキスト用の安定版 Flash-Lite のみ（-preview / -image / -tts 等は除外）
+_FLASH_LITE_RE = re.compile(r"^gemini-(\d+(?:\.\d+)*)-flash-lite$")
+
+
+def resolve_gemini_model(conf: dict) -> str:
+    """GEMINI_MODEL が指定されていればそれを使い、未指定なら
+    Gemini API のモデル一覧から最新バージョンの Flash-Lite を選ぶ。"""
+    if conf.get("gemini_model"):
+        return conf["gemini_model"]
+    try:
+        resp = requests.get(
+            f"{GEMINI_API_BASE}/models",
+            headers={"x-goog-api-key": conf["gemini_api_key"]},
+            params={"pageSize": 1000},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        candidates = []
+        for m in resp.json().get("models", []):
+            name = m.get("name", "").removeprefix("models/")
+            mt = _FLASH_LITE_RE.match(name)
+            if mt and "generateContent" in m.get("supportedGenerationMethods", []):
+                version = tuple(int(x) for x in mt.group(1).split("."))
+                candidates.append((version, name))
+        if candidates:
+            model = max(candidates)[1]
+            log(f"GEMINI_MODEL 未指定 → 最新の Flash-Lite を自動選択: {model}")
+            return model
+        log(f"⚠️ Flash-Lite がモデル一覧に見つからず。{GEMINI_FALLBACK_MODEL} を使用")
+    except Exception as e:
+        log(f"⚠️ モデル一覧の取得に失敗（{e}）。{GEMINI_FALLBACK_MODEL} を使用")
+    return GEMINI_FALLBACK_MODEL
+
+
+def _thinking_config(model: str) -> dict:
+    """思考トークンが出力枠を食わないよう、思考を最小にする設定。
+    Gemini 2.x は thinkingBudget=0 で無効化、3.x 以降は thinkingLevel=minimal。"""
+    mt = re.match(r"^gemini-(\d+)", model)
+    if mt and int(mt.group(1)) >= 3:
+        return {"thinkingLevel": "minimal"}
+    return {"thinkingBudget": 0}
+
+
 def analyze_with_llm(conf: dict, payload: dict) -> str:
     """Gemini API でトレーニングデータを分析してレポートを生成"""
     system_prompt = """あなたは経験豊富なランニングコーチです。
@@ -622,22 +667,39 @@ this_week_runs の各ランには次の情報があります:
 - テンポ/閾値: 設定ペースの維持、心拍が閾値域に収まっているか
 - イージー/回復走: 強度が上がりすぎていないか(hr_zone_pctでゾーン2中心か)、80/20の遵守
 
-日本語・プレーンテキスト・絵文字を適度に使い、最大2000文字。Markdownやコードブロックは使わない。
+【スマホ縦画面のLINEで読む前提の書式（厳守）】
+- 日本語・プレーンテキスト。Markdown（#, **, -, 表）やコードブロックは使わない。
+- 全体で1200文字以内。1行は25文字程度までにし、長い文は2行に分けるか短く言い切る。
+- 文章で説明せず「・」の箇条書きで要点のみ。1行に1つの事柄。前置き・繰り返し・締めの挨拶は書かない。
+- 見出しは「絵文字＋【見出し】」の1行（例: 🏃【各ランの講評】）。項目の間は空行で区切る。
+- 数値は「4'52"/km」「心拍158」のように短く書く。
 
-構成:
-1. 今週のサマリー（一言評価）
-2. 各ランの講評（1本ずつ。種別を明記し、良かった点＋具体的改善ポイントを数値根拠つきで）
-3. 週全体のバランス（強度配分・80/20、距離・質のバランス）
-4. 目標(goal_time/goal_race_pace)への進捗評価
-5. 来週のトレーニングプラン ← 具体的に、次を必ず含めること:
+【分割ルール】次の3ブロックで出力し、ブロックの間には「===」だけの行を1行入れる（LINEで別投稿になる）。
+ブロック1:
+  ✅【今週のひとこと】1〜2行の総評
+  🏃【各ランの講評】1本につき「日付 種別 距離」の1行＋「◎良かった点」1行＋「△改善点」1〜2行
+===
+ブロック2:
+  ⚖️【週のバランス】強度配分(80/20)・距離と質のバランスを2〜3行
+  🎯【目標への進捗】goal_time/goal_race_pace に対する評価を2〜3行
+===
+ブロック3:
+  📅【来週のプラン】（後述の要件を満たす。1日1行「月 10/13 休養」「火 10/14 インターバル 1000m×5 4'30"」の形式。日付は例なので必ず next_week_calendar の値を使う）
+  最後に「週◯回・合計◯km」の1行と、ポイント1行
+
+各ブロックの内容（ブロック1の講評、ブロック3のプラン）は次の要件を満たすこと:
+1. 各ランの講評（1本ずつ。種別を明記し、良かった点＋具体的改善ポイントを数値根拠つきで、短く）
+2. 週全体のバランス（強度配分・80/20、距離・質のバランス）
+3. 目標(goal_time/goal_race_pace)への進捗評価
+4. 来週のトレーニングプラン ← 具体的に、次を必ず含めること:
    - next_week_calendar の月曜(from)から日曜(to)までの1週間を対象にする（火曜始まりにしない）
    - 推奨頻度: 週何回走るか（休養日の配置も）
    - 目標距離: 来週の合計距離の目安（runner_profileの週間距離目標と、今週の実績・残り週数を踏まえる）
    - 練習メニュー: 主要練習を曜日ごとに、種別・距離・ペース・本数まで具体的に提示する
      （曜日・日付は next_week_calendar の値をそのまま使うこと。レースは upcoming_races に
        来週該当のものがある場合のみ入れる）
-     例)「火: インターバル 1000m×5（4'30"/km, レスト200mジョグ）」「日: ロング走 24km（5'10"/km）」
-       「他: イージー 8km（6'00"/km）を2回」
+     例)「火 10/14 インターバル 1000m×5 4'30"」「日 10/19 ロング走 24km 5'10"」
+       「水 10/15 イージー 8km 6'00"」
    - 80/20の強度配分を意識し、今週の課題（各ランの講評で挙げた点）を補う内容にすること"""
 
     user_text = (
@@ -645,7 +707,7 @@ this_week_runs の各ランには次の情報があります:
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{conf['gemini_model']}:generateContent"
+    url = f"{GEMINI_API_BASE}/models/{conf['gemini_model']}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": conf["gemini_api_key"],
@@ -656,10 +718,10 @@ this_week_runs の各ランには次の情報があります:
         "generationConfig": {
             "temperature": 0.4,
             "maxOutputTokens": 6144,
-            # 2.5 Flash は思考(thinking)が標準ON。思考トークンが maxOutputTokens を
-            # 消費し本文が途中で切れるため、思考を無効化(0)して全枠を出力に充てる。
+            # 思考トークンが maxOutputTokens を消費し本文が途中で切れるのを防ぐため、
+            # 思考を最小化して出力枠を本文に充てる（モデル世代で指定方法が異なる）。
             # 各ランの講評で出力が長くなるため上限を増やしている。
-            "thinkingConfig": {"thinkingBudget": 0},
+            "thinkingConfig": _thinking_config(conf["gemini_model"]),
         },
     }
 
@@ -672,6 +734,11 @@ this_week_runs の各ランには次の情報があります:
         resp = requests.post(url, headers=headers, json=body, timeout=60)
         if resp.status_code < 400:
             break
+        # 思考設定がモデルに受け付けられない場合は、指定を外して再試行
+        if resp.status_code == 400 and "thinkingConfig" in body["generationConfig"]:
+            log(f"⚠️ Gemini 400（{resp.text[:200]}）。thinkingConfig を外して再試行...")
+            body["generationConfig"].pop("thinkingConfig")
+            continue
         # リトライ対象: 429(レート)/500/502/503/504(一時障害)
         if resp.status_code in (429, 500, 502, 503, 504) and i < attempts:
             delay = base_delay * i
@@ -700,16 +767,60 @@ this_week_runs の各ランには次の情報があります:
     return text
 
 
-def send_line_message(conf: dict, text: str):
-    """LINE Messaging API でプッシュメッセージを送信"""
+LINE_MAX_MESSAGES = 5      # 1回のpushで送れる吹き出し数の上限
+LINE_MAX_CHARS    = 5000   # 1吹き出しの文字数上限
+SPLIT_TARGET      = 700    # 区切りが無い時に1吹き出しへ詰める目安文字数
+
+
+def _chunk_by_length(text: str, limit: int) -> list:
+    """空行（段落）単位で、limit 文字を目安に分割する。"""
+    chunks, cur = [], ""
+    for para in re.split(r"\n\s*\n", text.strip()):
+        cand = f"{cur}\n\n{para}" if cur else para
+        if cur and len(cand) > limit:
+            chunks.append(cur)
+            cur = para
+        else:
+            cur = cand
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def split_report(report: str) -> list:
+    """LLMレポートを「===」行で分割。区切りが無ければ段落単位で長さ分割。"""
+    parts = [p.strip() for p in re.split(r"^\s*={3,}\s*$", report, flags=re.M)]
+    parts = [p for p in parts if p]
+    if len(parts) <= 1:
+        parts = _chunk_by_length(report, SPLIT_TARGET)
+    # 長すぎる塊はさらに分割
+    out = []
+    for p in parts:
+        out.extend(_chunk_by_length(p, SPLIT_TARGET * 2) if len(p) > SPLIT_TARGET * 2 else [p])
+    return out
+
+
+def build_line_messages(blocks: list) -> list:
+    """吹き出しの配列を LINE の上限（5件・各5000字）に収める。"""
+    blocks = [b.strip() for b in blocks if b and b.strip()]
+    # 5件を超えたら末尾側を結合
+    while len(blocks) > LINE_MAX_MESSAGES:
+        blocks[-2] = blocks[-2] + "\n\n" + blocks.pop()
+    return [b[:LINE_MAX_CHARS] for b in blocks]
+
+
+def send_line_message(conf: dict, text):
+    """LINE Messaging API でプッシュメッセージを送信。
+    text に list を渡すと、それぞれ別の吹き出しとして送る（最大5件）。"""
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {conf['line_token']}",
     }
+    texts = build_line_messages(text if isinstance(text, list) else [text])
     payload = {
         "to": conf["line_user_id"],
-        "messages": [{"type": "text", "text": text}],
+        "messages": [{"type": "text", "text": t} for t in texts],
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=10)
     return resp.status_code, resp.text
@@ -777,6 +888,7 @@ def main():
 
     # ── LLM 分析 ────────────────────────────────────
     try:
+        conf["gemini_model"] = resolve_gemini_model(conf)
         log(f"Gemini API（{conf['gemini_model']}）で分析中...")
         payload = build_payload(conf, weeks_data, this_week_runs, today)
         log("── 送信データ（JSON） ──")
@@ -796,14 +908,15 @@ def main():
 
     # ── LINE 送信 ────────────────────────────────────
     try:
-        header        = f"🏃 週次ランニングレポート\n📅 {today.strftime('%Y年%m月%d日')}\n\n"
-        summary_block = format_week_summary(weeks_data[0])
+        # 吹き出し1: 数値データ / 2以降: LLMレポートを「===」で分割したもの
+        header        = f"🏃 週次ランニングレポート\n📅 {today.strftime('%Y/%m/%d')}"
+        summary_block = header + "\n\n" + format_week_summary(weeks_data[0])
         types_block   = format_week_types(this_week_runs)
         if types_block:
             summary_block += "\n\n" + types_block
-        summary_block += "\n\n" + "─" * 14 + "\n\n"
-        message       = header + summary_block + report
-        status, body  = send_line_message(conf, message)
+        messages      = [summary_block] + split_report(report)
+        log(f"LINE送信: {len(build_line_messages(messages))}通に分割")
+        status, body  = send_line_message(conf, messages)
         if status == 200:
             log("✅ LINE送信成功")
         else:

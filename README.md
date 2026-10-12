@@ -3,16 +3,18 @@
 Garmin Connect から直近4週間のランニングデータを取得し、Gemini（無料枠）で
 コーチ視点の分析を生成して、毎週 LINE に通知するツールです。
 
-```
-🏃 週次ランニングレポート
-📅 2026年06月27日
+スマホの縦画面で読みやすいよう、最大4通の吹き出しに分けて届きます。
 
-📊 今週のサマリー
-  走行回数   : 4 回
-  総距離     : 41.5 km
-  ...
-──────────────
-（Geminiによるコーチング講評）
+```
+【1通目】🏃 週次ランニングレポート
+📅 2026/06/29
+📊【対象週のサマリー】
+・4回 / 41.5km
+・最長 18.2km  ...
+
+【2通目】✅【今週のひとこと】／🏃【各ランの講評】
+【3通目】⚖️【週のバランス】／🎯【目標への進捗】
+【4通目】📅【来週のプラン】（1日1行）
 ```
 
 ---
@@ -52,7 +54,8 @@ Garmin Connect から直近4週間のランニングデータを取得し、Gemi
 4. 表示された文字列をコピー → `config.ini` の `api_key` に貼り付け
 
 - クレジットカード登録は不要です。
-- 無料枠では gemini-2.5-flash が 1日250リクエスト・10 RPM 使えます（週1回の実行なら十分）。
+- 無料枠で使える Flash-Lite を利用します。モデル未指定なら、実行時に最新の Flash-Lite を
+  自動選択します（週1回の実行なら無料枠で十分）。
 - **無料枠ではプロンプト・応答がGoogleの品質改善に使われる場合があります**。気になる場合は
   Google Cloud で課金を有効化（Tier 1）すると学習対象外になります（従量課金。週1実行なら極小額）。
 
@@ -297,7 +300,7 @@ python setup_garmin_token.py        # Windowsは python、Macは python3
 
 | 名前 | 値の例 |
 |------|--------|
-| `GEMINI_MODEL` | `gemini-2.5-flash` |
+| `GEMINI_MODEL` | 未設定なら最新の Flash-Lite を自動選択。固定する場合のみ `gemini-3.5-flash-lite` 等 |
 | `GOAL_MARATHON_TIME` | `3時間30分` |
 | `GOAL_RACE_PACE` | `4:58/km` |
 | `RUNNER_PROFILE` | 目標・方針の説明（複数行可） |
@@ -365,7 +368,7 @@ python setup_garmin_token.py        # Windowsは python、Macは python3
 | Garminログインエラー | メール/パスワードを確認。MFA有効だと失敗することあり。`pip install --upgrade garminconnect curl_cffi ua-generator` で最新化 |
 | `Failed to retrieve social profile` | Garmin側のレート制限(429)/トークン期限切れ。数時間おいて `setup_garmin_token.py` でトークン再生成し `GARMIN_TOKENS` を更新（連打しない）。`GARMIN_EMAIL`/`GARMIN_PASSWORD` を登録しておくと自動でメール/パスワード認証に切替 |
 | LINEに届かない | Botを**友だち追加**したか、`user_id`（U始まり）が正しいか確認 |
-| レポートが途中で切れる | `garmin_report.log` に `MAX_TOKENS` 警告が出ていないか確認（本ツールは思考OFF設定済み） |
+| レポートが途中で切れる | `garmin_report.log` に `MAX_TOKENS` 警告が出ていないか確認（本ツールは思考を最小に設定済み） |
 | Gemini 429エラー | 無料枠のレート上限。少し待つか、課金有効化で上限引き上げ |
 
 ログは `garmin_report.log` に毎回追記されます。問題切り分けの際はまずこれを確認してください。
